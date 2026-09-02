@@ -21,7 +21,7 @@ Roles seeded (edit below or pre-provision tables in your DB):
     user_roles(user_name, role)              — user -> role
     role_perms(role, table_name, can_select, can_write) — role -> table perms
 """
-import argparse, os, sys, tempfile, time
+import argparse, os, re, sys, tempfile, time
 
 try:
     import duckdb
@@ -96,14 +96,21 @@ def main():
                     [args.token])
         con.execute("INSERT INTO user_roles VALUES "
                     "('researcher','researcher_role'),('viewer','viewer_role'),('tunnel','tunnel_role')")
-        con.execute(
-            "INSERT INTO role_perms VALUES "
-            "('researcher_role','mimic_icd_map',true,false),('researcher_role','lab_loinc_map',true,false),"
-            "('researcher_role','rxnorm_ndc_map',true,false),('researcher_role','concept_std',true,false),"
-            "('viewer_role','mimic_icd_map',true,false),('viewer_role','lab_loinc_map',false,false),"
-            "('viewer_role','rxnorm_ndc_map',false,false),('viewer_role','concept_std',false,false),"
-            "('tunnel_role','mimic_icd_map',true,false),('tunnel_role','lab_loinc_map',false,false),"
-            "('tunnel_role','rxnorm_ndc_map',false,false),('tunnel_role','concept_std',false,false)")
+        # 动态授权：从 rbac lua 的 protected 清单给 researcher_role 全表读权限，
+        # viewer_role 只给 4 张本体词表(公开展示层)，tunnel_role 最小(仅 admissions 供隧道探测)
+        # RBAC 元数据表(quack_*/user_*/role_*)永不授权——客户端一律不可读写
+        protected_tables = re.findall(r"'(\w+)'", lua_src.split("protected")[1].split("}")[0])
+        data_tables = [t for t in protected_tables
+                       if not t.startswith(("quack_", "user_", "role_"))]
+        perms_sql = ",".join(
+            f"('researcher_role','{t}',true,false)" for t in data_tables)
+        viewer_tables = [t for t in data_tables if t.startswith("s_")]
+        perms_sql += "," + ",".join(
+            f"('viewer_role','{t}',true,false)" for t in viewer_tables)
+        perms_sql += ",('tunnel_role','admissions',true,false)"
+        con.execute(f"INSERT INTO role_perms VALUES {perms_sql}")
+        print(f"seeded perms: researcher={len(data_tables)} tables, "
+              f"viewer={len(viewer_tables)} tables (RBAC meta excluded)", flush=True)
 
     # --- quack + quackhole (MUST load BEFORE SET GLOBAL hooks: settings only
     #     exist after the extension is loaded; setting them earlier is silently dropped) ---

@@ -7,38 +7,36 @@
 -- Role-Based Access Control policy engine for DuckDB Quack (LuaJIT 5.1).
 --
 -- 定位：Quack 是强制点（每条查询 PREPARE 前跑 authorization 钩子），本库是策略引擎。
+-- 版本：v2 — 适配 mimic_demo.duckdb（23 对象：12 临床表 + 6 模板语义层 + 4 SNOMED 本体层 + 1 golden 校验）
+--
 -- 安全前提（务必读）：
 --   1) 授权钩子默认拒绝一切写语句（allow_write=false）——否则客户端可
 --      SET GLOBAL quack_authorization_function / CREATE OR REPLACE MACRO / 篡改权限表 绕过；
 --   2) 权限元数据表与数据同平面，本库通过“禁写”保护它们（管理员在服务器本地执行 grant/setup）；
 --   3) 语句类型判断基于 SQL 文本前缀，非解析器——官方文档亦警告
 --      “WITH x AS (SELECT 1) INSERT INTO t ...” 型绕过；strict_write=true 时 WITH 前缀一律拒绝（宁可错杀）。
---
--- 表模型（管理员在服务器会话执行 luajit_s('rbac', {op:'setup'}) 一次）：
---   quack_tokens (auth_token PK, user_name)   -- token→用户
---   quack_sessions (sid PK, user_name)        -- 连接→用户（authn 钩子写入）
---   user_roles (user_name, role)              -- 用户→角色
---   role_perms (role, table_name, can_select, can_write)  -- 角色→表权限
---
--- 挂钩（服务器会话，LOAD luajit + compile 本库之后）：
---   CREATE MACRO rbac_authn(sid, ct, st) AS (luajit_s('rbac', {op:'authn', sid:sid, client_token:ct, server_token:st})::BOOLEAN);
---   CREATE MACRO rbac_authz(sid, q)    AS (luajit_s('rbac', {op:'authz', sid:sid, q:q})::BOOLEAN);
---   SET GLOBAL quack_authentication_function = 'rbac_authn';
---   SET GLOBAL quack_authorization_function  = 'rbac_authz';
---
--- 调用（luajit_s('rbac', {op:...})）：
---   authn  → BOOLEAN（查 token 表 + 写会话表）
---   authz  → BOOLEAN（白名单 + 角色表级权限）
---   grant  → 管理员专用 {op:'grant', role, tbl, can_select, can_write} 改 role_perms（仅服务器本地执行！）
---   setup  → 管理员专用：建 4 张 RBAC 表（仅服务器本地执行！）
---   status → 配置快照（调试用）
 
 local CONFIG = {
   tokens_table   = 'quack_tokens',
   sessions_table = 'quack_sessions',
   roles_table    = 'user_roles',
   perms_table    = 'role_perms',
-  protected      = { 'mimic_icd_map', 'lab_loinc_map', 'rxnorm_ndc_map', 'concept_std' },  -- 受控表清单（authz 逐表查权限）
+  -- mimic_demo 受控表清单：临床表(患者隐私) + 模板语义层 + 本体层 + golden + RBAC 元数据(防读防写) 全保护
+  protected      = {
+    -- RBAC 权限元数据（禁止客户端读写——否则可自授角色绕过）
+    'quack_tokens', 'quack_sessions', 'user_roles', 'role_perms',
+    -- 12 基础临床表
+    'admissions', 'patients', 'diagnoses_icd', 'procedures_icd',
+    'd_icd_diagnoses', 'd_icd_procedures', 'drgcodes', 'services',
+    'transfers', 'icustays', 'd_items', 'charlson',
+    -- 6 模板语义层
+    'mortality', 'demographics', 'icd_diagnoses', 'prognosis',
+    'comorbidities', 'study_comorbidity_flags',
+    -- 4 本体层 (SNOMED/LOINC/RxNorm)
+    's_mimic_icd_map', 's_lab_loinc_map', 's_rxnorm_ndc_map', 's_concept_std',
+    -- 1 golden 校验
+    'template_golden',
+  },
   allow_write    = false,  -- true = 放行写语句并按 can_write 细粒度授权；false = 一切写语句拒绝（推荐）
   strict_write   = true,   -- true = WITH 开头一律拒绝（防 “WITH x AS (SELECT 1) INSERT INTO t” 型绕过）
   audit_table    = nil,    -- 设 'rbac_audit' 则 authz 每次决策记审计（每查询多一次写，性能敏感慎用）
