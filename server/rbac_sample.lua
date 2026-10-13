@@ -38,7 +38,13 @@ local CONFIG = {
   sessions_table = 'quack_sessions',
   roles_table    = 'user_roles',
   perms_table    = 'role_perms',
-  protected      = { 'secret_data', 'public_data' },  -- 受控表清单（authz 逐表查权限）
+  -- 受控表清单（authz 逐表查权限）。v2 修复（2026-10-13 实测驱动，见 wiki 四路对比报告附录）：
+  --   RBAC 元数据四表必须列入 protected，否则任何已认证用户可直读 quack_tokens 拿到全部 token 明文
+  protected      = {
+    'quack_tokens', 'quack_sessions', 'user_roles', 'role_perms',
+    'secret_data', 'public_data',
+  },
+  default_deny   = true,  -- true = 语句引用到的任何已存在表都必须有授权（防 allow-by-absence）；false = 旧行为
   allow_write    = false,  -- true = 放行写语句并按 can_write 细粒度授权；false = 一切写语句拒绝（推荐）
   strict_write   = true,   -- true = WITH 开头一律拒绝（防 “WITH x AS (SELECT 1) INSERT INTO t” 型绕过）
   audit_table    = nil,    -- 设 'rbac_audit' 则 authz 每次决策记审计（每查询多一次写，性能敏感慎用）
@@ -80,9 +86,56 @@ local function user_has_perm(user, tbl, need_write)
   return (q(r, 1, 'n') or 0) > 0
 end
 
+-- 语句中引用表的提取：大小写不敏感 + 词边界匹配（v2 修复：旧版 string.find(query, tbl, 1, true)
+-- 用原始 SQL 做**大小写敏感**子串匹配，SECRET_DATA 全大写引用可完全绕过检查）
+local function refs_table(query, tbl)
+  local q = string.lower(query)
+  local t = string.lower(tbl)
+  local init = 1
+  while true do
+    local s, e = string.find(q, t, init, true)
+    if not s then return false end
+    -- 词边界：前一个字符与后一个字符都不能是 [A-Za-z0-9_]
+    local before_ok = (s == 1) or not string.match(string.sub(q, s - 1, s - 1), '^[%w_]$')
+    local after_c  = string.sub(q, e + 1, e + 1)
+    local after_ok = (after_c == '') or not string.match(after_c, '^[%w_]$')
+    if before_ok and after_ok then return true end
+    init = e + 1
+  end
+end
+
+-- default-deny 授权检查（v2）：提取语句实际引用的、**已存在**的表，逐表要求授权。
+-- - 大小写不敏感（修复 A1）；- 任何已存在表无授权即拒（修复 A2 allow-by-absence）；
+-- - 不存在的表名不在检查面内（duckdb 本会抛 Catalog Error，不构成泄露通道）。
+local function referenced_tables(query)
+  local found = {}
+  local rows = _duckdb_query(
+    "SELECT table_name FROM duckdb_tables() UNION ALL SELECT view_name AS table_name FROM duckdb_views()")
+  for _, r in ipairs(rows or {}) do
+    local tn = r['table_name']
+    if tn and refs_table(query, tn) then found[#found+1] = tn end
+  end
+  -- 临时表/别名无法经 duckdb_tables() 枚举，退回 protected 清单逐表 refs_table（含大小写修复）
+  for _, tn in ipairs(CONFIG.protected) do
+    if refs_table(query, tn) then
+      local dup = false
+      for _, f in ipairs(found) do if string.lower(f) == string.lower(tn) then dup = true break end end
+      if not dup then found[#found+1] = tn end
+    end
+  end
+  return found
+end
+
 local function check_tables(query, user, need_write)
+  if CONFIG.default_deny then
+    for _, tbl in ipairs(referenced_tables(query)) do
+      if not user_has_perm(user, tbl, need_write) then return false end
+    end
+    return true
+  end
+  -- 旧行为（default_deny=false）：仅检查 protected 清单（已含大小写修复）
   for _, tbl in ipairs(CONFIG.protected) do
-    if string.find(query, tbl, 1, true) then
+    if refs_table(query, tbl) then
       if not user_has_perm(user, tbl, need_write) then return false end
     end
   end
@@ -98,10 +151,17 @@ local function authn(p)
   return true
 end
 
+-- v2 修复（实测驱动）：SELECT luajit_s('rbac',{op:'grant'/'setup'/'authn'...}) 是带副作用的伪读语句，
+-- 旧版被归类为 read 放行。authz 内直接封杀对 luajit_s 自身的任何远程调用（grant/setup 只能服务器本地执行）。
+local function calls_luajit_s(query)
+  return string.find(string.lower(query), 'luajit_s', 1, true) ~= nil
+end
+
 local function authz(p)
   local query = p.q or ''
   local up = string.upper(query:gsub('^%s+', ''):gsub('%s+$', ''))
   if up == '' then return false end
+  if calls_luajit_s(query) then return false end  -- 管理操作不得经远程 SQL 触达
   local kind = classify(up)
   if kind == 'unknown' then return false end
   if kind == 'read' and up:find('^WITH') and CONFIG.strict_write then return false end  -- 防 WITH 注入式写绕过
@@ -124,7 +184,14 @@ local function grant(p)
       " VALUES ('" .. esc(p.role or '') .. "', '" .. esc(p.tbl or '') .. "', " ..
       (p.can_select and 'true' or 'false') .. ", " .. (p.can_write and 'true' or 'false') .. ")")
   end)
-  return ok and 'ok' or ('error: ' .. tostring(err))
+  if not ok then return 'error: ' .. tostring(err) end
+  -- v2 修复（实测驱动）：旧版 _duckdb_query 出错不抛 Lua 异常 → grant 报 ok 但未落库（静默失败）。
+  -- 现在回读验证，落库失败立即报 error。
+  local r = _duckdb_query("SELECT COUNT(*) AS n FROM " .. CONFIG.perms_table ..
+    " WHERE role = '" .. esc(p.role or '') .. "' AND table_name = '" .. esc(p.tbl or '') .. "' AND " ..
+    "can_select = " .. (p.can_select and 'true' or 'false') .. " AND can_write = " .. (p.can_write and 'true' or 'false'))
+  if (q(r, 1, 'n') or 0) < 1 then return 'error: grant not persisted (check role_perms schema/PK)' end
+  return 'ok'
 end
 
 local function setup()
