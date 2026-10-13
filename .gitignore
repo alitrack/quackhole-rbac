@@ -7,3 +7,8 @@ __pycache__/
 *.log
 .venv/
 venv/
+# quackhole tickets are bearer credentials — never commit
+ticket.txt
+*.ticket
+qh_rbac_ticket.txt
+server.pid

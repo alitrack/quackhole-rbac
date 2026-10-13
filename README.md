@@ -100,7 +100,7 @@ Real mode (driven by the `protected` list in `rbac_mimic.lua`):
 
 Sample mode (demo): `analyst` reads both `public_data` and `secret_data`; `viewer` reads `public_data` only; the tunnel identity reads `public_data` only.
 
-RBAC metadata tables (`quack_*` / `user_*` / `role_*`) are not granted to clients in real mode. (In sample mode the four metadata tables are **not** in the `protected` list — a sample-only gap; see the security review.)
+RBAC metadata tables (`quack_*` / `user_*` / `role_*`) are never granted to clients — since v3 they are always denied regardless of the `protected` list (the sample-mode metadata gap that existed in v2 is closed structurally; see the security boundary section).
 
 ## Verification (sample-mode matrix, tested 2026-09-01)
 
@@ -124,7 +124,7 @@ write (INSERT)         → DENY
 unregistered token     → DENY (authentication)
 ```
 
-**This is a dated test run, not a security guarantee.** The matrix is sample-mode only (hardcoded demo tokens/tables), it labels every exception `[DENY]` (so infrastructure errors and authorization failures are not distinguished), and the enforcement below has known limitations.
+**This is a dated test run, not a security guarantee.** Since v3 the matrix distinguishes authentication failures (AUTHN), authorization failures (AUTHZ) and other errors (OTHER), asserts the expected outcome of every case, and exits non-zero on any unexpected result; `--matrix-tokens` / `--matrix-tables` make it usable in real mode, not sample-only. A regression suite that re-checks the engine, the server's hook chain, and reseed idempotency lives in [tests/verify_rbac.py](tests/verify_rbac.py).
 
 ## Pitfalls (learned the hard way)
 
@@ -139,15 +139,24 @@ unregistered token     → DENY (authentication)
 
 ## Security boundary (read this carefully)
 
-This is a **policy-enforcement sketch, not a hardened authorization boundary.** Known limitations, confirmed by code review:
+Since **v3** the policy engine closes the bypasses found in the v2 code review. What was fixed:
 
-- **Table checks are case-sensitive substring matches on the raw SQL text, not a parser.** A protected table referenced in uppercase (`SELECT * FROM SECRET_DATA`) escapes the check entirely; an unlisted table can be read with no grant at all; a string literal or comment containing a table name causes a false denial. The correct fix is a parsed, default-deny check over resolved table references.
-- **Side-effecting `SELECT`s are classified as reads.** If `luajit_s` is reachable from remote SQL, a client can call `SELECT luajit_s('rbac', {op:'grant', ...})` or `{op:'setup'}` to write permissions or DDL; the "all writes denied" rule does not cover these. (Live reachability depends on the runtime.)
-- **The `luajit_s` dispatcher exposes `grant` / `setup` / `authn` with no administrator check** — "administrators only" is a comment, not an enforced gate.
-- **The tunnel token is also a valid application credential** (maps to the minimal `tunnel` role), and demo tokens (`researcher-tok`, `alice-tok`, …) are seeded in real mode. Provision private credentials for production.
-- Permission metadata lives in the same plane as the data and is protected only by the write-deny policy. **Grant changes must be executed in a local server session.**
-- There is **no row-level security or column masking** (queries are not rewritten), and no session revocation/expiry.
-- For production use, add: a per-user ticket per client, an `audit_table`, your own iroh relay, and the enforcement fixes above before treating this as a trust boundary.
+- **Case bypass closed** — table references are matched case-insensitively (DuckDB identifiers are case-insensitive), so `SELECT * FROM SECRET_DATA` can no longer skip the permission check.
+- **Default-deny over the whole catalog** — authz checks *every* table/view present in the database, not just a hand-listed subset; a table with no grant is denied to everyone (v2 let any authenticated user read unlisted tables).
+- **RBAC metadata always denied** — `quack_tokens` / `quack_sessions` / `user_roles` / `role_perms` are never readable or writable by any role, and `grant()` refuses to authorize them (v2's sample mode let a client `SELECT * FROM quack_tokens` to steal other users' tokens).
+- **`luajit_s` / `INSTALL` / `LOAD` / `ATTACH` / `PRAGMA` / `SET GLOBAL` blocked** — these function/keyword tokens are rejected anywhere in a remote query, so a client can no longer invoke `SELECT luajit_s('rbac', {op:'grant'...})` / `{op:'setup'}` to write permissions or DDL, nor install/load/attach from the tunnel. `grant`/`setup` are now only reachable from a local server session.
+- **Stacked / side-effecting reads blocked** — a read statement containing a strong write keyword (`INSERT`/`UPDATE`/…) is denied, and `EXPLAIN ANALYZE <write>` is denied; `strict_write` denies `WITH … <write>` while still allowing legitimate CTE reads (v2's blanket `WITH` rejection broke them).
+- **Session handling hardened** — `authn` validates the session id and never overwrites an existing session mapping (no victim SID takeover); the seed is idempotent so the server can restart against the same DB; the ticket file is written `0600`.
+
+Remaining, **documented** limitations (this is a policy-enforcement baseline, not a hardened boundary):
+
+- **Text matching, not a parser.** Enforcement still works on the query *text* (case-insensitive, word-boundary substring matching), not on a parsed AST with resolved object dependencies. A string literal or comment that happens to contain a table name or a blocked keyword causes a **false denial** (a legitimate query is rejected — never a bypass). A view/macro whose *name* is unlisted but that selects protected tables is checked by its visible name.
+- The **`luajit_s` dispatcher is only safe because the blacklist covers the function names a client could reach**; a newly introduced engine function reachable from SQL would need to be added to `BLOCKED_TOKENS`.
+- There is **no row-level security or column masking** (queries are not rewritten), and **no session revocation/expiry** (a removed token's already-established session stays valid until the server restarts).
+- The **tunnel token is also a valid application credential** (maps to the minimal `tunnel` role); demo tokens (`researcher-tok`, `alice-tok`, …) are seeded in the scripts. Provision private, operator-issued credentials for production.
+- **The P2P transport is third-party iroh** (quackhole); a same-host server+client shares one iroh identity and iroh refuses self-connection by design — verify the tunnel path across two hosts.
+
+For production use, add: a per-user ticket per client, an `audit_table`, your own iroh relay, operator-issued credentials, and — if you need a true boundary — a parser-based policy that resolves table references and restricts callable functions.
 
 ## Repository layout
 
@@ -155,10 +164,12 @@ This is a **policy-enforcement sketch, not a hardened authorization boundary.** 
 server/
   server.py          # server: RBAC + quack hooks + quackhole, supports --sample / --db
   rbac_mimic.lua     # MIMIC terminology-layer policy (protected = 23 MIMIC objects)
-  rbac_sample.lua    # demo policy (protected = secret_data / public_data)
+  rbac_sample.lua    # demo policy (protected = secret_data / public_data / other_data)
 client/
   client.py          # client: attach + per-user token swap + query / verification matrix
-qhctl.sh             # one-command start/stop/status wrapper (example paths/token — parameterize before reuse)
+tests/
+  verify_rbac.py     # regression suite: engine + server hook chain + reseed idempotency
+qhctl.sh             # start/stop/status wrapper (portable; override paths/token via QH_* env)
 ```
 
 ## License
