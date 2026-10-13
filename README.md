@@ -35,8 +35,8 @@ External client ──quackhole (iroh P2P encrypted tunnel, no public IP)──�
 # Demo mode: auto-creates a sample DB (secret_data / public_data) + demo roles
 python server/server.py --sample --token my-tunnel-tok
 
-# Real mode: serve an existing DuckDB data file (e.g. a MIMIC terminology layer)
-python server/server.py --db /path/to/mimic_standard.duckdb --token my-tunnel-tok
+# Real mode: serve an existing DuckDB data file
+python server/server.py --db /path/to/your_data.duckdb --token my-tunnel-tok
 
 # On Windows, if 9494 is taken by the WSL relay, add --port 9495
 ```
@@ -54,7 +54,7 @@ python client/client.py --ticket /path/to/ticket.txt --token alice-tok \
 
 # Real-mode example: a per-user token and a table in the served DB
 python client/client.py --ticket /path/to/ticket.txt --token researcher-tok \
-    --sql "SELECT count(*) FROM r.s_mimic_icd_map"
+    --sql "SELECT count(*) FROM r.public_data"
 
 # Run the sample-mode verification matrix (legitimate access + bypass attempts)
 python client/client.py --ticket /path/to/ticket.txt --matrix
@@ -90,13 +90,13 @@ Policy (configurable in `rbac.lua`):
 
 ### Seeded roles
 
-Real mode (driven by the `protected` list in `rbac_mimic.lua`):
+Real mode (driven by the `protected` list in your policy lua — copy `rbac_sample.lua` and edit the list):
 
 | Role | Readable tables | Notes |
 |---|---|---|
-| `researcher_role` | all `protected` data objects, excluding RBAC metadata | full research access |
-| `viewer_role` | data objects prefixed `s_` (the public terminology layer) | restricted viewing |
-| `tunnel_role` | `admissions` only | minimal privilege for the tunnel's first connection |
+| `researcher_role` | all `protected` data objects, excluding RBAC metadata | full read access |
+| `viewer_role` | data objects prefixed `s_` (a shared/public layer convention) | restricted viewing |
+| `tunnel_role` | the first data table only | minimal privilege for the tunnel's first connection |
 
 Sample mode (demo): `analyst` reads both `public_data` and `secret_data`; `viewer` reads `public_data` only; the tunnel identity reads `public_data` only.
 
@@ -163,11 +163,11 @@ This is a **policy-enforcement sketch, not a hardened authorization boundary.** 
 ```
 server/
   server.py          # server: RBAC + quack hooks + quackhole, supports --sample / --db
-  rbac_mimic.lua     # MIMIC terminology-layer policy (protected = 23 MIMIC objects)
-  rbac_sample.lua    # demo policy (protected = secret_data / public_data)
+  rbac_sample.lua    # demo policy (protected = secret_data / public_data + RBAC metadata); copy & edit the list for real mode
 client/
   client.py          # client: attach + per-user token swap + query / verification matrix
-qhctl.sh             # one-command start/stop/status wrapper (example paths/token — parameterize before reuse)
+test/
+  test_rbac_lua.py   # lua policy engine unit regression (23 cases, no network needed)
 ```
 
 ## License

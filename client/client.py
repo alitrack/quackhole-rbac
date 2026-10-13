@@ -8,14 +8,14 @@ Two auth layers are used (verified 2026-09):
 
 Usage:
     python client.py --ticket /tmp/qh_rbac_ticket.txt --token researcher-tok \
-        --sql "SELECT count(*) FROM r.mimic_icd_map"
+        --sql "SELECT count(*) FROM r.public_data"
     python client.py --ticket ... --token viewer-tok --sql "..." --via qq   # server-side quack_query
     python client.py --ticket ... --matrix                                   # full test matrix
 
 Options:
     --ticket   quackhole ticket file (default: /tmp/qh_rbac_ticket.txt)
     --token    per-user token (default: researcher-tok)
-    --sql      SQL to run (default: SELECT count(*) FROM r.mimic_icd_map)
+    --sql      SQL to run (default: SELECT count(*) FROM r.public_data)
     --via      attach (default) or qq (quack_query, guaranteed server-side)
     --matrix   run the full pass/deny matrix used in verification
 """
@@ -79,7 +79,7 @@ def attempt(con, secret_name, scope, label, token, sql, via="qq"):
 
 def matrix(con, secret_name, scope):
     # sample-mode identities (alice=analyst full, bob=viewer limited); for real-mode
-    # MIMIC servers pass --matrix-tokens "researcher-tok,viewer-tok,evil-tok"
+    # real-mode servers pass --matrix-tokens "researcher-tok,viewer-tok,evil-tok"
     full_tok, limited_tok, evil_tok = "alice-tok", "bob-tok", "evil-tok"
     print("=== legitimate access ===", flush=True)
     attempt(con, secret_name, scope, "full-role secret_data", full_tok,
@@ -113,7 +113,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ticket", default=os.path.join(tempfile.gettempdir(), "qh_rbac_ticket.txt"))
     ap.add_argument("--token", default="researcher-tok")
-    ap.add_argument("--sql", default="SELECT count(*) FROM r.mimic_icd_map")
+    ap.add_argument("--sql", default="SELECT count(*) FROM r.public_data")
     ap.add_argument("--via", choices=["attach", "qq"], default="attach")
     ap.add_argument("--matrix", action="store_true")
     ap.add_argument("--allow-unsigned", action="store_true",

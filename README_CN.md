@@ -35,8 +35,8 @@ DuckDB 数据文件始终留在服务器上;外部客户端通过加密 P2P 隧�
 # 演示模式:自动建 sample 库(secret_data / public_data)+ 演示角色
 python server/server.py --sample --token my-tunnel-tok
 
-# 真实模式:连已有的 DuckDB 数据文件(如 MIMIC 词表层)
-python server/server.py --db /path/to/mimic_standard.duckdb --token my-tunnel-tok
+# 真实模式:连已有的 DuckDB 数据文件
+python server/server.py --db /path/to/your_data.duckdb --token my-tunnel-tok
 
 # Windows 上若 9494 被 WSL 中继占用,加 --port 9495
 ```
@@ -54,7 +54,7 @@ python client/client.py --ticket /path/to/ticket.txt --token alice-tok \
 
 # 真实模式示例:per-user token + 受服务库中的表
 python client/client.py --ticket /path/to/ticket.txt --token researcher-tok \
-    --sql "SELECT count(*) FROM r.s_mimic_icd_map"
+    --sql "SELECT count(*) FROM r.public_data"
 
 # 跑演示模式验证矩阵(合法访问 + 绕过攻击)
 python client/client.py --ticket /path/to/ticket.txt --matrix
@@ -90,13 +90,13 @@ RBAC 元数据是四张表(由 `rbac.lua` 的 `setup` 自动创建):
 
 ### 预置角色
 
-真实模式(由 `rbac_mimic.lua` 的 `protected` 清单驱动):
+真实模式(由你的策略 lua 的 `protected` 清单驱动——复制 `rbac_sample.lua` 并编辑清单):
 
 | 角色 | 可读表 | 说明 |
 |---|---|---|
 | `researcher_role` | `protected` 里除 RBAC 元数据外的全部数据对象 | 全量研究员 |
 | `viewer_role` | 以 `s_` 开头的对象(公开展示层) | 受限查看 |
-| `tunnel_role` | 仅 `admissions` | 隧道首连的最小权限 |
+| `tunnel_role` | 仅第一张数据表 | 隧道首连的最小权限 |
 
 演示模式(sample):`analyst` 可读 `public_data` 与 `secret_data`;`viewer` 仅 `public_data`;隧道身份仅读 `public_data`。
 
@@ -163,11 +163,11 @@ bob/viewer      读 secret_data   → DENY(授权)
 ```
 server/
   server.py          # 服务端:RBAC + quack hooks + quackhole,支持 --sample / --db
-  rbac_mimic.lua     # MIMIC 词表层策略(protected = 23 个 MIMIC 对象)
-  rbac_sample.lua    # 演示策略(protected = secret_data / public_data)
+  rbac_sample.lua    # 演示策略(protected = secret_data / public_data + RBAC 元数据);真实模式复制并编辑清单
 client/
   client.py          # 客户端:attach + per-user 换 token + 查询/验证矩阵
-qhctl.sh             # 一键 start/stop/status 封装(示例路径/token——复用前请参数化)
+test/
+  test_rbac_lua.py   # lua 策略引擎单元回归(23 测例,无需网络)
 ```
 
 ## License

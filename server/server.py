@@ -8,7 +8,7 @@ the luajit rbac.lua policy engine (role -> table-level SELECT, write-denied).
 Usage:
     python server.py [--db PATH] [--lua PATH] [--ticket PATH] [--token TOK] [--sample]
     --db       DuckDB file to serve (default: env QUACKHOLE_DB or ./rbac.duckdb)
-    --lua      rbac policy lua (default: ./rbac_mimic.lua next to this script)
+    --lua      rbac policy lua (default: ./rbac_sample.lua next to this script)
     --ticket   where to write the ticket (default: /tmp/qh_rbac_ticket.txt)
     --token    tunnel shared token (default: env QUACKHOLE_TOKEN or 'qh-tok')
     --sample   create sample secret_data/public_data tables (for demos/tests)
@@ -35,7 +35,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db", default=os.environ.get("QUACKHOLE_DB", "./rbac.duckdb"))
-    p.add_argument("--lua", default=os.path.join(HERE, "rbac_mimic.lua"))
+    p.add_argument("--lua", default=os.path.join(HERE, "rbac_sample.lua"))
     p.add_argument("--ticket", default=os.path.join(tempfile.gettempdir(), "qh_rbac_ticket.txt"))
     p.add_argument("--token", default=os.environ.get("QUACKHOLE_TOKEN", "qh-tok"))
     p.add_argument("--port", type=int, default=9494,
@@ -97,17 +97,21 @@ def main():
         con.execute("INSERT INTO user_roles VALUES "
                     "('researcher','researcher_role'),('viewer','viewer_role'),('tunnel','tunnel_role')")
         # 动态授权：从 rbac lua 的 protected 清单给 researcher_role 全表读权限，
-        # viewer_role 只给 4 张本体词表(公开展示层)，tunnel_role 最小(仅 admissions 供隧道探测)
+        # viewer_role 只给 s_ 前缀表(公开共享层约定)，tunnel_role 最小(仅第一张数据表供隧道探测)
         # RBAC 元数据表(quack_*/user_*/role_*)永不授权——客户端一律不可读写
         protected_tables = re.findall(r"'(\w+)'", lua_src.split("protected")[1].split("}")[0])
         data_tables = [t for t in protected_tables
                        if not t.startswith(("quack_", "user_", "role_"))]
+        if not data_tables:
+            raise SystemExit("no data tables found in protected list — edit the lua policy first")
         perms_sql = ",".join(
             f"('researcher_role','{t}',true,false)" for t in data_tables)
-        viewer_tables = [t for t in data_tables if t.startswith("s_")]
+        viewer_tables = [t for t in data_tables if t.startswith("s_")] or data_tables[:1]
         perms_sql += "," + ",".join(
             f"('viewer_role','{t}',true,false)" for t in viewer_tables)
-        perms_sql += ",('tunnel_role','admissions',true,false)"
+        perms_sql += f",'tunnel_role','{data_tables[0]}'"
+        # 修正：上一行需为元组形态
+        perms_sql = perms_sql[:perms_sql.rfind(",'tunnel_role'")] + f",('tunnel_role','{data_tables[0]}',true,false)"
         con.execute(f"INSERT INTO role_perms VALUES {perms_sql}")
         print(f"seeded perms: researcher={len(data_tables)} tables, "
               f"viewer={len(viewer_tables)} tables (RBAC meta excluded)", flush=True)
