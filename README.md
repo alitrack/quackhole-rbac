@@ -137,10 +137,21 @@ docs/
 
 ## 安全边界(务必读)
 
-- 授权钩子基于 **SQL 文本前缀**判断语句类型,非解析器——官方文档亦承认 `WITH` 型绕过,靠 `strict_write=true` 兜底
-- 权限元数据表与数据同平面,靠"禁写"保护;管理员加权限请在**服务器本地会话**执行
+> **2026-10-13 v2 加固**:经独立探针测试 + 三域代码 review 实测复现,已修复以下问题(全部有单元回归 `test/test_rbac_lua.py` 23/23 覆盖):
+> - ✅ 大小写绕过(`SELECT * FROM SECRET_DATA` 曾完全绕过表检查)——现大小写不敏感 + 词边界匹配
+> - ✅ 未列名表零授权可读(allow-by-absence)——现 `default_deny=true`:语句引用的任何**已存在**表/视图都必须有授权
+> - ✅ sample 模式 RBAC 元数据暴露(`SELECT * FROM quack_tokens` 曾可直接 dump token 明文)——四张元数据表已进 protected
+> - ✅ `SELECT luajit_s('rbac',{op:'grant'/'setup'})` 远程提权——authz 现封杀对 `luajit_s` 的任何远程调用
+> - ✅ grant 静默失败(报 ok 实际未落库)——现回读验证,失败显式报 error
+> - ✅ 视图检查盲区(未授权视图不在 `duckdb_tables()` 里)——枚举已含 `duckdb_views()`
+
+仍然存在的限制(如实声明):
+
+- 授权钩子基于 **SQL 文本前缀**判断语句类型,非解析器;`WITH` 开头的合法 CTE 读会被 `strict_write=true` 误杀(已知取舍)
+- 子串匹配修复后为词边界匹配,但极端构造(动态 SQL、SQL 方言差异)仍非解析器级保证
 - 无行级安全/列掩码(不能改写查询)
-- 生产使用请加:每用户独立 ticket、quack 鉴权 + 审计表(`audit_table`)、自建 iroh relay
+- 权限元数据表与数据同平面,靠"禁写+protected"保护;管理员加权限请在**服务器本地会话**执行
+- 生产使用请加:每用户独立 ticket、审计表(`audit_table`)、自建 iroh relay
 
 ## License
 
