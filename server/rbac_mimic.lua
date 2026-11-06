@@ -192,6 +192,13 @@ local function authz(p)
   local up = string.upper(query)
   up = up:gsub('^%s+', ''):gsub('%s+$', '')
   if up == '' then return false end
+  -- 0) quack client ATTACH handshake catalog discovery (exact shapes) → allow.
+  -- Without this the v3 default-deny kills the client own schema listing
+  -- (information_schema.schemata 2-col + duckdb_tables UNION duckdb_views)
+  -- and every ATTACH fails with Authorization failed.
+  local hs1 = up:find("^SELECT CATALOG_NAME, SCHEMA_NAME") and up:find("INFORMATION_SCHEMA%.SCHEMATA")
+  local hs2 = up:find("^SELECT SCHEMA_NAME, SQL") and up:find("DUCKDB_TABLES") and up:find("DUCKDB_VIEWS") and up:find("UNION ALL")
+  if hs1 or hs2 then return true end
 
   -- 1) 函数/关键字黑名单：任意位置出现即拒（大小写不敏感）
   for _, bt in ipairs(BLOCKED_TOKENS) do
