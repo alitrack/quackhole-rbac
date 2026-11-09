@@ -100,7 +100,7 @@ RBAC 元数据是四张表(由 `rbac.lua` 的 `setup` 自动创建):
 
 演示模式(sample):`analyst` 可读 `public_data` 与 `secret_data`;`viewer` 仅 `public_data`;隧道身份仅读 `public_data`。
 
-RBAC 元数据表(`quack_*` / `user_*` / `role_*`)在真实模式下不授予任何客户端。(演示模式下这 4 张元数据表**不在** `protected` 清单内——属演示模式的缺口,见安全边界。)
+RBAC 元数据表(`quack_*` / `user_*` / `role_*`)从不授予任何客户端——自 v3 起无论 `protected` 清单如何,它们恒被拒绝(v2 中演示模式的元数据缺口已被结构性修复,见安全边界)。
 
 ## 验证(演示模式矩阵,2026-09-01 实测)
 
@@ -124,7 +124,7 @@ bob/viewer      读 secret_data   → DENY(授权)
 未注册 token      → DENY(认证)
 ```
 
-**这是一次带日期的测试运行,不是安全保证。** 矩阵只覆盖演示模式(硬编码演示 token/表),把一切异常都标成 `[DENY]`(不区分基础设施错误与授权拒绝),且下面的强制机制存在已知局限。
+**这是一次带日期的测试运行,不是安全保证。** 自 v3 起,矩阵区分认证失败(AUTHN)、授权失败(AUTHZ)与其他错误(OTHER),对每个用例断言预期结果,出现意外即以非零码退出;`--matrix-tokens` / `--matrix-tables` 让它可用于真实模式而非仅演示模式。回归测试套件(复验引擎、服务端钩子链、reseed 幂等)见 [tests/verify_rbac.py](tests/verify_rbac.py)。
 
 ## 已踩的坑
 
@@ -139,35 +139,37 @@ bob/viewer      读 secret_data   → DENY(授权)
 
 ## 安全边界(务必读)
 
-这是一个**策略强制的演示骨架,不是加固过的授权边界。** 代码评审确认的已知局限:
+自 **v3** 起,策略引擎已关闭 v2 代码评审发现的绕过路径。已修复:
 
-> **2026-10-13 v2 加固**(独立探针实测 + 代码评审复现,单元回归 `test/test_rbac_lua.py` 23/23 覆盖):
-> - ✅ 大小写绕过(`SELECT * FROM SECRET_DATA`)已修复——大小写不敏感 + 词边界匹配
-> - ✅ 未列名表零授权可读(allow-by-absence)已修复——`default_deny=true`:语句引用的任何**已存在**表/视图都必须有授权
-> - ✅ 演示模式元数据暴露已修复——四张 RBAC 元数据表已进 `protected`
-> - ✅ `SELECT luajit_s('rbac',{op:'grant'/'setup'})` 远程提权已封杀——authz 拒绝任何远程 `luajit_s` 调用
-> - ✅ grant 静默失败已修复——回读验证,失败显式报 error
-> - ✅ 视图检查盲区已修复——枚举已含 `duckdb_views()`
+- **大小写绕过已堵**——表引用按大小写不敏感匹配(DuckDB 标识符大小写不敏感),`SELECT * FROM SECRET_DATA` 再也无法跳过权限检查。
+- **全目录 default-deny**——authz 检查数据库中*所有*表/视图,而非手工列出的子集;无授权的表对所有人拒绝(v2 允许任何已认证用户读未列名表)。
+- **RBAC 元数据恒拒**——`quack_tokens` / `quack_sessions` / `user_roles` / `role_perms` 任何角色都不可读写,且 `grant()` 拒绝为其授权(v2 的 sample 模式可让客户端 `SELECT * FROM quack_tokens` 窃取其他用户 token)。
+- **`luajit_s` / `INSTALL` / `LOAD` / `ATTACH` / `PRAGMA` / `SET GLOBAL` 被屏蔽**——这些函数/关键字 token 在远程查询文本任意位置出现即被拒绝,客户端无法再用 `SELECT luajit_s('rbac', {op:'grant'...})` / `{op:'setup'}` 写权限或 DDL,也无法从隧道 install/load/attach。`grant`/`setup` 现在只能由服务器本地会话触达。
+- **堆叠/带副作用的读被堵**——含强写关键字(`INSERT`/`UPDATE`/…)的读语句被拒绝,`EXPLAIN ANALYZE <写>` 被拒绝;`strict_write` 拒绝 `WITH … <写>` 同时放行合法 CTE 读(v2 的一刀切 `WITH` 拒绝会误杀它们)。
+- **会话处理加固**——`authn` 校验会话 id 且永不覆盖已有会话映射(无受害者 SID 劫持);seed 幂等,服务端可对着同一 DB 重启;ticket 文件以 `0600` 写入。
 
+仍存在的**已声明**局限(这是策略强制基线,不是加固边界):
 
-- **表检查是对原始 SQL 文本做大小写敏感的子串匹配,不是解析器。** 受保护表用大写引用(`SELECT * FROM SECRET_DATA`)会完全绕过检查;未列名的表可以在无任何授权的情况下被读;字符串字面量或注释里含表名会造成误拒。正确做法是对解析后、已解析的表引用做 default-deny 检查。
-- **带副作用的 `SELECT` 被归类为读。** 若 `luajit_s` 可从远程 SQL 触达,客户端可用 `SELECT luajit_s('rbac', {op:'grant', ...})` 或 `{op:'setup'}` 写权限/执行 DDL;"一切写语句拒绝" 覆盖不到这些。(实际可达性取决于运行时。)
-- **`luajit_s` 分发器暴露了 `grant` / `setup` / `authn`,没有任何管理员校验**——"仅管理员"是注释,不是强制门。
-- **隧道 token 本身也是一个合法的应用层凭证**(映射到最小 `tunnel` 角色),且演示 token(`researcher-tok`、`alice-tok` 等)在真实模式下被 seed。生产环境应使用私有的、运维自行下发的凭证。
-- 权限元数据表与数据同平面,仅靠"禁写"保护;**加权限请在服务器本地会话执行**。
-- **无行级安全/列掩码**(不重写查询),也没有会话吊销/过期机制。
-- 生产使用需补:每用户独立 ticket、`audit_table` 审计、自建 iroh relay,并在把本服务当作信任边界前完成上述强制机制的修复。
+- **基于文本匹配,不是解析器。** 强制仍作用于查询*文本*(大小写不敏感、词边界子串匹配),而非解析出的 AST 与已解析对象依赖。字符串字面量或注释里恰好含表名/被屏蔽关键字会造成**误拒**(合法查询被拒——绝不构成绕过)。一个名字未列名、但内部 SELECT 了受保护表的视图/宏,按可见名检查。
+- **`luajit_s` 分发器之所以安全,是因为黑名单覆盖了客户端可能触达的函数名**;将来新增的可从 SQL 触达的引擎函数需同步加入 `BLOCKED_TOKENS`。
+- **无行级安全/列掩码**(不重写查询),也**无会话吊销/过期**(已建立会话的 token 被删除后,直到服务端重启前仍有效)。
+- **隧道 token 本身也是合法应用层凭证**(映射到最小 `tunnel` 角色);演示 token(`researcher-tok`、`alice-tok` 等)在脚本里被 seed。生产应使用运维私有下发的凭证。
+- **P2P 传输是第三方 iroh**(quackhole);同一主机上的 server+client 共享一个 iroh 身份,iroh 按设计拒绝自连——隧道路径需跨两主机验证。
+
+生产使用需补:每用户独立 ticket、`audit_table`、自建 iroh relay、运维下发凭证;若需要真正的信任边界,则改用解析器策略解析表引用并限制可调用函数。
 
 ## 目录结构
 
 ```
 server/
   server.py          # 服务端:RBAC + quack hooks + quackhole,支持 --sample / --db
-  rbac_sample.lua    # 演示策略(protected = secret_data / public_data + RBAC 元数据);真实模式复制并编辑清单
+  rbac_mimic.lua     # MIMIC 词表层策略(protected = 23 个 MIMIC 对象)
+  rbac_sample.lua    # 演示策略(protected = secret_data / public_data / other_data)
 client/
   client.py          # 客户端:attach + per-user 换 token + 查询/验证矩阵
-test/
-  test_rbac_lua.py   # lua 策略引擎单元回归(23 测例,无需网络)
+tests/
+  verify_rbac.py     # 回归套件:引擎 + 服务端钩子链 + reseed 幂等
+qhctl.sh             # start/stop/status 封装(可移植;经 QH_* 环境变量覆盖路径/token)
 ```
 
 ## License

@@ -1,56 +1,55 @@
 -- @lib: rbac
 -- @category: security
--- @desc: Quack RBAC 策略引擎——token 认证 + 连接会话记录 + 角色表级授权 + 只读白名单加固，
---        挂 quack_authentication_function / quack_authorization_function 钩子（普通模式，需 _duckdb_query）
+-- @desc: Quack RBAC 策略引擎 v3（演示策略）——protected = secret_data / public_data / other_data；
+--        全目录 default-deny + RBAC 元数据恒拒 + 函数黑名单。挂 quack authn/authz 钩子。
 -- @source: original（duckdb-luajit 系列）
 -- @requires: _duckdb_query（普通模式；trusted 沙箱下不可用）
--- Role-Based Access Control policy engine for DuckDB Quack (LuaJIT 5.1).
 --
--- 定位：Quack 是强制点（每条查询 PREPARE 前跑 authorization 钩子），本库是策略引擎。
--- 安全前提（务必读）：
---   1) 授权钩子默认拒绝一切写语句（allow_write=false）——否则客户端可
---      SET GLOBAL quack_authorization_function / CREATE OR REPLACE MACRO / 篡改权限表 绕过；
---   2) 权限元数据表与数据同平面，本库通过“禁写”保护它们（管理员在服务器本地执行 grant/setup）；
---   3) 语句类型判断基于 SQL 文本前缀，非解析器——官方文档亦警告
---      “WITH x AS (SELECT 1) INSERT INTO t ...” 型绕过；strict_write=true 时 WITH 前缀一律拒绝（宁可错杀）。
+-- 与 rbac_mimic.lua 完全同引擎（v3），仅 protected 清单不同。
+-- 安全模型说明、v3 修复项（大小写/全目录 default-deny/元数据恒拒/函数黑名单/堆叠语句）、
+-- 已知残留（字面量误拒）—— 全部见 rbac_mimic.lua 头部注释。
 --
--- 表模型（管理员在服务器会话执行 luajit_s('rbac', {op:'setup'}) 一次）：
---   quack_tokens (auth_token PK, user_name)   -- token→用户
---   quack_sessions (sid PK, user_name)        -- 连接→用户（authn 钩子写入）
---   user_roles (user_name, role)              -- 用户→角色
---   role_perms (role, table_name, can_select, can_write)  -- 角色→表权限
+-- 重要：v2 的"sample 未把元数据表列入 protected → 可 dump quack_tokens"漏洞
+-- 在 v3 中由 META_TABLES 恒拒结构性修复，与 protected 清单无关。
 --
--- 挂钩（服务器会话，LOAD luajit + compile 本库之后）：
---   CREATE MACRO rbac_authn(sid, ct, st) AS (luajit_s('rbac', {op:'authn', sid:sid, client_token:ct, server_token:st})::BOOLEAN);
---   CREATE MACRO rbac_authz(sid, q)    AS (luajit_s('rbac', {op:'authz', sid:sid, q:q})::BOOLEAN);
---   SET GLOBAL quack_authentication_function = 'rbac_authn';
---   SET GLOBAL quack_authorization_function  = 'rbac_authz';
---
--- 调用（luajit_s('rbac', {op:...})）：
---   authn  → BOOLEAN（查 token 表 + 写会话表）
---   authz  → BOOLEAN（白名单 + 角色表级权限）
---   grant  → 管理员专用 {op:'grant', role, tbl, can_select, can_write} 改 role_perms（仅服务器本地执行！）
---   setup  → 管理员专用：建 4 张 RBAC 表（仅服务器本地执行！）
---   status → 配置快照（调试用）
+-- 表模型 / 挂钩 / 调用：同 rbac_mimic.lua。
 
 local CONFIG = {
   tokens_table   = 'quack_tokens',
   sessions_table = 'quack_sessions',
   roles_table    = 'user_roles',
   perms_table    = 'role_perms',
-  -- 受控表清单（authz 逐表查权限）。v2 修复（2026-10-13 实测驱动，见 wiki 四路对比报告附录）：
-  --   RBAC 元数据四表必须列入 protected，否则任何已认证用户可直读 quack_tokens 拿到全部 token 明文
-  protected      = {
-    'quack_tokens', 'quack_sessions', 'user_roles', 'role_perms',
-    'secret_data', 'public_data',
-  },
-  default_deny   = true,  -- true = 语句引用到的任何已存在表都必须有授权（防 allow-by-absence）；false = 旧行为
+  -- 演示受控表：secret_data(机密) / public_data(公开) / other_data(未授权演示表，验证 default-deny)
+  protected      = { 'secret_data', 'public_data', 'other_data' },
   allow_write    = false,  -- true = 放行写语句并按 can_write 细粒度授权；false = 一切写语句拒绝（推荐）
-  strict_write   = true,   -- true = WITH 开头一律拒绝（防 “WITH x AS (SELECT 1) INSERT INTO t” 型绕过）
+  strict_write   = true,   -- true = WITH 开头且含写关键字一律拒绝（合法 CTE 读放行）
   audit_table    = nil,    -- 设 'rbac_audit' 则 authz 每次决策记审计（每查询多一次写，性能敏感慎用）
 }
 
-local READ_KWS  = { 'SELECT', 'FROM', 'WITH', 'EXPLAIN', 'DESCRIBE', 'SHOW', 'VALUES', 'TABLE', 'PRAGMA', 'SUMMARIZE' }
+local META_TABLES = {
+  [CONFIG.tokens_table]   = true,
+  [CONFIG.sessions_table] = true,
+  [CONFIG.roles_table]    = true,
+  [CONFIG.perms_table]    = true,
+}
+local CATALOG_BLOCK = { 'INFORMATION_SCHEMA', 'PG_CATALOG', 'DUCKDB_CATALOG' }
+local BLOCKED_TOKENS = {
+  { t = 'LUAJIT_S',     prefix = false },
+  { t = 'LUAJIT_QUERY', prefix = false },
+  { t = 'LUAJIT_MODULE', prefix = false },
+  { t = 'LUAJIT(',      prefix = false },
+  { t = 'INSTALL',      prefix = false },
+  { t = 'LOAD',         prefix = true  },
+  { t = 'ATTACH',       prefix = false },
+  { t = 'DETACH',       prefix = false },
+  { t = 'PRAGMA',       prefix = false },
+  { t = 'SET GLOBAL',   prefix = false },
+  { t = 'DUCKDB_',      prefix = true  },
+}
+local MID_WRITE_KWS = { 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'CREATE', 'DROP',
+                        'ALTER', 'COPY', 'EXECUTE', 'CALL', 'TRUNCATE' }
+
+local READ_KWS  = { 'SELECT', 'FROM', 'WITH', 'EXPLAIN', 'DESCRIBE', 'SHOW', 'VALUES', 'TABLE', 'SUMMARIZE' }
 local WRITE_KWS = { 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'COPY', 'CREATE', 'DROP', 'ALTER', 'SET', 'CALL',
                     'ATTACH', 'DETACH', 'EXPORT', 'IMPORT', 'CHECKPOINT', 'VACUUM', 'COMMENT', 'INSTALL',
                     'LOAD', 'PREPARE', 'EXECUTE', 'USE', 'GRANT', 'REVOKE', 'TRUNCATE' }
@@ -61,6 +60,22 @@ end
 
 local function q(rows, i, col)
   return rows and rows[i] and rows[i][col]
+end
+
+local function text_has(needle, hay, prefix)
+  local i = 1
+  while true do
+    local s = hay:find(needle, i, true)
+    if not s then return false end
+    local prev_ok = (s == 1) or (hay:sub(s - 1, s - 1):match('[%w_]') == nil)
+    if prev_ok then
+      if prefix then return true end
+      local e = s + #needle - 1
+      local next_ok = (e == #hay) or (hay:sub(e + 1, e + 1):match('[%w_]') == nil)
+      if next_ok then return true end
+    end
+    i = s + 1
+  end
 end
 
 local function classify(up)
@@ -86,90 +101,107 @@ local function user_has_perm(user, tbl, need_write)
   return (q(r, 1, 'n') or 0) > 0
 end
 
--- 语句中引用表的提取：大小写不敏感 + 词边界匹配（v2 修复：旧版 string.find(query, tbl, 1, true)
--- 用原始 SQL 做**大小写敏感**子串匹配，SECRET_DATA 全大写引用可完全绕过检查）
-local function refs_table(query, tbl)
-  local q = string.lower(query)
-  local t = string.lower(tbl)
-  local init = 1
-  while true do
-    local s, e = string.find(q, t, init, true)
-    if not s then return false end
-    -- 词边界：前一个字符与后一个字符都不能是 [A-Za-z0-9_]
-    local before_ok = (s == 1) or not string.match(string.sub(q, s - 1, s - 1), '^[%w_]$')
-    local after_c  = string.sub(q, e + 1, e + 1)
-    local after_ok = (after_c == '') or not string.match(after_c, '^[%w_]$')
-    if before_ok and after_ok then return true end
-    init = e + 1
+local function catalog_names()
+  local r = _duckdb_query(
+    "SELECT table_name FROM duckdb_tables() WHERE table_schema NOT IN ('information_schema','pg_catalog','temp','duckdb_catalog') " ..
+    "UNION SELECT table_name FROM duckdb_views() WHERE table_schema NOT IN ('information_schema','pg_catalog','temp','duckdb_catalog')")
+  local set = {}
+  for i = 1, (r and #r or 0) do
+    local n = r[i]['table_name']
+    if n then set[n:lower()] = true end
   end
-end
-
--- default-deny 授权检查（v2）：提取语句实际引用的、**已存在**的表，逐表要求授权。
--- - 大小写不敏感（修复 A1）；- 任何已存在表无授权即拒（修复 A2 allow-by-absence）；
--- - 不存在的表名不在检查面内（duckdb 本会抛 Catalog Error，不构成泄露通道）。
-local function referenced_tables(query)
-  local found = {}
-  local rows = _duckdb_query(
-    "SELECT table_name FROM duckdb_tables() UNION ALL SELECT view_name AS table_name FROM duckdb_views()")
-  for _, r in ipairs(rows or {}) do
-    local tn = r['table_name']
-    if tn and refs_table(query, tn) then found[#found+1] = tn end
-  end
-  -- 临时表/别名无法经 duckdb_tables() 枚举，退回 protected 清单逐表 refs_table（含大小写修复）
-  for _, tn in ipairs(CONFIG.protected) do
-    if refs_table(query, tn) then
-      local dup = false
-      for _, f in ipairs(found) do if string.lower(f) == string.lower(tn) then dup = true break end end
-      if not dup then found[#found+1] = tn end
-    end
-  end
-  return found
-end
-
-local function check_tables(query, user, need_write)
-  if CONFIG.default_deny then
-    for _, tbl in ipairs(referenced_tables(query)) do
-      if not user_has_perm(user, tbl, need_write) then return false end
-    end
-    return true
-  end
-  -- 旧行为（default_deny=false）：仅检查 protected 清单（已含大小写修复）
-  for _, tbl in ipairs(CONFIG.protected) do
-    if refs_table(query, tbl) then
-      if not user_has_perm(user, tbl, need_write) then return false end
-    end
-  end
-  return true
+  return set
 end
 
 local function authn(p)
+  local sid = p.sid or ''
+  if sid == '' or #sid > 128 or not sid:match('^[%w%._%-/]+$') then return false end
   local rows = _duckdb_query(
     "SELECT user_name FROM " .. CONFIG.tokens_table .. " WHERE auth_token = '" .. esc(p.client_token or '') .. "'")
   local user = q(rows, 1, 'user_name')
   if not user then return false end
-  _duckdb_query("INSERT INTO " .. CONFIG.sessions_table .. " VALUES ('" .. esc(p.sid or '') .. "', '" .. esc(user) .. "')")
+  _duckdb_query(
+    "INSERT INTO " .. CONFIG.sessions_table .. " " ..
+    "SELECT '" .. esc(sid) .. "' AS sid, '" .. esc(user) .. "' AS user_name " ..
+    "WHERE NOT EXISTS (SELECT 1 FROM " .. CONFIG.sessions_table .. " WHERE sid = '" .. esc(sid) .. "')")
   return true
-end
-
--- v2 修复（实测驱动）：SELECT luajit_s('rbac',{op:'grant'/'setup'/'authn'...}) 是带副作用的伪读语句，
--- 旧版被归类为 read 放行。authz 内直接封杀对 luajit_s 自身的任何远程调用（grant/setup 只能服务器本地执行）。
-local function calls_luajit_s(query)
-  return string.find(string.lower(query), 'luajit_s', 1, true) ~= nil
 end
 
 local function authz(p)
   local query = p.q or ''
-  local up = string.upper(query:gsub('^%s+', ''):gsub('%s+$', ''))
+  local up = string.upper(query)
+  up = up:gsub('^%s+', ''):gsub('%s+$', '')
   if up == '' then return false end
-  if calls_luajit_s(query) then return false end  -- 管理操作不得经远程 SQL 触达
+
+  -- 0) quack client ATTACH handshake catalog discovery (exact shapes) → allow.
+  -- Without this the v3 default-deny kills the client's own schema listing
+  -- (information_schema.schemata 2-col + duckdb_tables UNION duckdb_views)
+  -- and every ATTACH fails with Authorization failed. (backport of the
+  -- rbac_mimic.lua fix 1cd8632 — applies to any quack client, LAN direct
+  -- or quackhole tunnel.)
+  local hs1 = up:find("^SELECT CATALOG_NAME, SCHEMA_NAME") and up:find("INFORMATION_SCHEMA%.SCHEMATA")
+  -- hs2 covers both client generations: v1.x sends "SELECT schema_name, sql",
+  -- v2.x sends "SELECT schema_oid, sql" (same tables/views UNION ALL shape).
+  local hs2 = up:find("^SELECT SCHEMA") and up:find(", SQL") and up:find("DUCKDB_TABLES") and up:find("DUCKDB_VIEWS") and up:find("UNION ALL")
+  -- DuckDB v2.x clients ATTACH with a WITH RECURSIVE schema_tree probe instead:
+  -- duckdb_schemas() tree walk + current_database(), reading no user tables.
+  local hs3 = up:find("^WITH RECURSIVE SCHEMA_TREE") and up:find("DUCKDB_SCHEMAS%(%)" ) and up:find("CURRENT_DATABASE%(%)" )
+  -- v2.x clients also wrap the ATTACH probe in a transaction: bare
+  -- BEGIN TRANSACTION / ROLLBACK / COMMIT (exact match, no payload).
+  -- Safe: these carry no data; every DML still passes through authz
+  -- statement-by-statement inside the transaction.
+  if up == "BEGIN TRANSACTION" or up == "ROLLBACK" or up == "COMMIT" then return true end
+  if hs1 or hs2 or hs3 then return true end
+
+  for _, bt in ipairs(BLOCKED_TOKENS) do
+    if text_has(bt.t, up, bt.prefix) then
+      return false
+    end
+  end
+  for _, cb in ipairs(CATALOG_BLOCK) do
+    if text_has(cb, up) then return false end
+  end
+
   local kind = classify(up)
   if kind == 'unknown' then return false end
-  if kind == 'read' and up:find('^WITH') and CONFIG.strict_write then return false end  -- 防 WITH 注入式写绕过
+
+  if kind == 'read' then
+    for _, kw in ipairs(MID_WRITE_KWS) do
+      if text_has(kw, up) then return false end
+    end
+    if up:find('^EXPLAIN') and (text_has('ANALYZE', up) or text_has('INSERT', up) or text_has('UPDATE', up)
+        or text_has('DELETE', up) or text_has('MERGE', up) or text_has('CREATE', up) or text_has('DROP', up)) then
+      return false
+    end
+    if CONFIG.strict_write and up:find('^WITH') then
+      for _, kw in ipairs(MID_WRITE_KWS) do
+        if text_has(kw, up) then return false end
+      end
+    end
+  end
+
   local user = resolve_user(p.sid)
   if not user then return false end
+
   local need_write = (kind == 'write')
   if need_write and not CONFIG.allow_write then return false end
-  if not check_tables(query, user, need_write) then return false end
+
+  for name in pairs(META_TABLES) do
+    if text_has(name:upper(), up) then return false end
+  end
+
+  local cat = catalog_names()
+  for bare in pairs(cat) do
+    if text_has(bare:upper(), up) then
+      if not user_has_perm(user, bare, need_write) then return false end
+    end
+  end
+  for _, tbl in ipairs(CONFIG.protected) do
+    if not cat[tbl] and text_has(tbl:upper(), up) then
+      if not user_has_perm(user, tbl, need_write) then return false end
+    end
+  end
+
   if CONFIG.audit_table then
     _duckdb_query("INSERT INTO " .. CONFIG.audit_table ..
       " VALUES ('" .. esc(p.sid or '') .. "', '" .. esc(user) .. "', '" .. esc(query) .. "', CURRENT_TIMESTAMP)")
@@ -177,21 +209,18 @@ local function authz(p)
   return true
 end
 
--- 管理员操作：仅服务器本地会话执行。若经 quack 客户端执行，会被 authz 白名单拒绝——这正是设计意图。
 local function grant(p)
+  local role, tbl = (p.role or ''):lower(), (p.tbl or ''):lower()
+  if role == '' or tbl == '' then return 'error: role/tbl required' end
+  if META_TABLES[tbl] then return 'error: cannot grant RBAC metadata table ' .. tbl end
+  local cat = catalog_names()
+  if not cat[tbl] then return 'error: table ' .. tbl .. ' not found' end
   local ok, err = pcall(function()
     _duckdb_query("INSERT OR REPLACE INTO " .. CONFIG.perms_table ..
-      " VALUES ('" .. esc(p.role or '') .. "', '" .. esc(p.tbl or '') .. "', " ..
+      " VALUES ('" .. esc(role) .. "', '" .. esc(tbl) .. "', " ..
       (p.can_select and 'true' or 'false') .. ", " .. (p.can_write and 'true' or 'false') .. ")")
   end)
-  if not ok then return 'error: ' .. tostring(err) end
-  -- v2 修复（实测驱动）：旧版 _duckdb_query 出错不抛 Lua 异常 → grant 报 ok 但未落库（静默失败）。
-  -- 现在回读验证，落库失败立即报 error。
-  local r = _duckdb_query("SELECT COUNT(*) AS n FROM " .. CONFIG.perms_table ..
-    " WHERE role = '" .. esc(p.role or '') .. "' AND table_name = '" .. esc(p.tbl or '') .. "' AND " ..
-    "can_select = " .. (p.can_select and 'true' or 'false') .. " AND can_write = " .. (p.can_write and 'true' or 'false'))
-  if (q(r, 1, 'n') or 0) < 1 then return 'error: grant not persisted (check role_perms schema/PK)' end
-  return 'ok'
+  return ok and 'ok' or ('error: ' .. tostring(err))
 end
 
 local function setup()
@@ -199,7 +228,7 @@ local function setup()
     "CREATE TABLE IF NOT EXISTS " .. CONFIG.tokens_table .. " (auth_token VARCHAR PRIMARY KEY, user_name VARCHAR)",
     "CREATE TABLE IF NOT EXISTS " .. CONFIG.sessions_table .. " (sid VARCHAR PRIMARY KEY, user_name VARCHAR)",
     "CREATE TABLE IF NOT EXISTS " .. CONFIG.roles_table .. " (user_name VARCHAR, role VARCHAR)",
-    "CREATE TABLE IF NOT EXISTS " .. CONFIG.perms_table .. " (role VARCHAR, table_name VARCHAR, can_select BOOLEAN, can_write BOOLEAN)",
+    "CREATE TABLE IF NOT EXISTS " .. CONFIG.perms_table .. " (role VARCHAR, table_name VARCHAR, can_select BOOLEAN, can_write BOOLEAN, PRIMARY KEY(role, table_name))",
   }
   for _, s in ipairs(ddl) do
     local ok, err = pcall(function() _duckdb_query(s) end)
@@ -214,6 +243,9 @@ return function(p)
   if p.op == 'authz' then return authz(p) end
   if p.op == 'grant' then return grant(p) end
   if p.op == 'setup' then return setup() end
+  if p.op == 'tables' then
+    return table.concat(CONFIG.protected, ',')
+  end
   if p.op == 'status' then
     return 'protected=' .. table.concat(CONFIG.protected, ',') .. ';allow_write=' .. tostring(CONFIG.allow_write) ..
            ';strict_write=' .. tostring(CONFIG.strict_write) .. ';audit=' .. tostring(CONFIG.audit_table or 'off')

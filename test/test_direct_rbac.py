@@ -32,7 +32,7 @@ PORT = free_port()
 
 srv = subprocess.Popen(
     [sys.executable, os.path.join(HERE, "..", "server", "server.py"),
-     "--direct", "--sample", "--db", DB, "--port", str(PORT),
+     "--direct", "--sample", "--force", "--db", DB, "--port", str(PORT),
      "--token", TOKEN, "--ticket", DB + ".endpoint"],
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
