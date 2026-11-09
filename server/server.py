@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""quackhole-rbac server: luajit RBAC policy + quack authn/authz hooks + quackhole P2P tunnel.
+"""quackhole-rbac server: luajit RBAC policy + quack authn/authz hooks + optional tunnel.
 
-Runs the RBAC-over-quackhole server on top of any DuckDB file. External clients
-attach via the printed quackhole ticket; every query is enforced server-side by
-the luajit rbac.lua policy engine (role -> table-level SELECT, write-denied).
+Runs the RBAC server on top of any DuckDB file. Two transport modes:
+
+  --direct (quack-rbac): bind quack_serve directly on the LAN — no relay,
+      no P2P hop, lowest query latency. Use this when clients can reach
+      the server over TCP (same LAN / VPN / port-forward).
+  default (quackhole): P2P tunnel via quackhole ticket — no public IP or
+      open ports needed, at the cost of relay-hop latency.
+
+Every query is enforced server-side by the luajit rbac.lua policy engine
+(role -> table-level SELECT, write-denied) in BOTH modes.
 
 Usage:
-    python server.py [--db PATH] [--lua PATH] [--ticket PATH] [--token TOK] [--sample]
+    python server.py [--db PATH] [--lua PATH] [--ticket PATH] [--token TOK] [--sample] [--direct]
     --db       DuckDB file to serve (default: env QUACKHOLE_DB or ./rbac.duckdb)
     --lua      rbac policy lua (default: ./rbac_sample.lua next to this script)
-    --ticket   where to write the ticket (default: /tmp/qh_rbac_ticket.txt)
-    --token    tunnel shared token (default: env QUACKHOLE_TOKEN or 'qh-tok')
+    --ticket   where to write the ticket / endpoint info (default: /tmp/qh_rbac_ticket.txt)
+    --token    shared token: tunnel token, or quack server token in --direct
+               (default: env QUACKHOLE_TOKEN or 'qh-tok')
+    --direct   LAN direct mode: quack_serve on 0.0.0.0:port instead of quackhole
+    --port     port to listen on (default 9494; pick another if taken)
     --sample   create sample secret_data/public_data tables (for demos/tests)
 
 Environment:
@@ -38,9 +48,11 @@ def parse_args():
     p.add_argument("--lua", default=os.path.join(HERE, "rbac_sample.lua"))
     p.add_argument("--ticket", default=os.path.join(tempfile.gettempdir(), "qh_rbac_ticket.txt"))
     p.add_argument("--token", default=os.environ.get("QUACKHOLE_TOKEN", "qh-tok"))
+    p.add_argument("--direct", action="store_true",
+                   help="LAN direct mode: quack_serve on 0.0.0.0:port, no quackhole relay")
     p.add_argument("--port", type=int, default=9494,
-                   help="quack port for quackhole to auto-serve (default 9494; "
-                        "use another port if 9494 is taken, e.g. by WSL's localhost relay)")
+                   help="port to listen on (default 9494; use another port if 9494 "
+                        "is taken, e.g. by WSL's localhost relay)")
     p.add_argument("--sample", action="store_true")
     p.add_argument("--luajit-so", default=None,
                    help="path to a locally-built luajit.duckdb_extension (unsigned); "
@@ -116,10 +128,11 @@ def main():
         print(f"seeded perms: researcher={len(data_tables)} tables, "
               f"viewer={len(viewer_tables)} tables (RBAC meta excluded)", flush=True)
 
-    # --- quack + quackhole (MUST load BEFORE SET GLOBAL hooks: settings only
+    # --- quack (MUST load BEFORE SET GLOBAL hooks: settings only
     #     exist after the extension is loaded; setting them earlier is silently dropped) ---
     con.execute("INSTALL quack; LOAD quack;")
-    con.execute("INSTALL quackhole FROM community; LOAD quackhole;")
+    if not args.direct:
+        con.execute("INSTALL quackhole FROM community; LOAD quackhole;")
 
     # --- quack authn/authz hooks ---
     con.execute("CREATE MACRO rbac_authn(sid, ct, st) AS "
@@ -137,13 +150,30 @@ def main():
     print("hooks verified:", hooks, flush=True)
     print("rbac status:", con.execute("SELECT luajit_s('rbac', {op:'status'})").fetchall(), flush=True)
 
-    row = con.execute(
-        "SELECT ticket FROM quackhole_serve(token := ?, target := ?, auto_serve := true)",
-        [args.token, f"127.0.0.1:{args.port}"]
-    ).fetchone()
-    with open(args.ticket, "w") as f:
-        f.write(row[0] + "\n")
-    print("SERVER_READY ticket_len:", len(row[0]), "ticket:", args.ticket, flush=True)
+    if args.direct:
+        # LAN direct mode (quack-rbac): skip the quackhole relay entirely,
+        # bind quack_serve on all interfaces. The authn/authz hooks above
+        # enforce exactly the same policy — the tunnel was transport, not
+        # enforcement.
+        # NOTE: binding 0.0.0.0 makes quack default to HTTPS on the server
+        # side while LAN clients speak plain HTTP ("Unsupported protocol"),
+        # so disable_ssl is REQUIRED for LAN direct mode — same conclusion as
+        # quack-lan-direct-and-rbac-handshake.md.
+        con.execute(f"CALL quack_serve('quack:0.0.0.0:{args.port}', token := ?, "
+                    "allow_other_hostname := true, disable_ssl := true)", [args.token])
+        with open(args.ticket, "w") as f:
+            f.write(f"quack:{args.token}@0.0.0.0:{args.port}\n")
+        print(f"SERVER_READY (direct) quack:0.0.0.0:{args.port} token={args.token} "
+              f"endpoint_file: {args.ticket}", flush=True)
+    else:
+        con.execute("INSTALL quackhole FROM community; LOAD quackhole;")
+        row = con.execute(
+            "SELECT ticket FROM quackhole_serve(token := ?, target := ?, auto_serve := true)",
+            [args.token, f"127.0.0.1:{args.port}"]
+        ).fetchone()
+        with open(args.ticket, "w") as f:
+            f.write(row[0] + "\n")
+        print("SERVER_READY ticket_len:", len(row[0]), "ticket:", args.ticket, flush=True)
     time.sleep(7200)
 
 
